@@ -16,7 +16,7 @@
 from typing import Any
 
 from fastapi import FastAPI
-from utils import grade_assistant_response
+from resources_servers.calendar.utils import grade_assistant_response
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,

@@ -8,6 +8,7 @@ calendar_simple_agent:
   responses_api_agents:
     simple_agent:
       entrypoint: app.py
+      max_steps: 6
       resources_server:
         type: resources_servers
         name: calendar
