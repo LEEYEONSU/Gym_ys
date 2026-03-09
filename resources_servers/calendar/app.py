@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import logging
+from typing import Any, Optional
 
 from fastapi import FastAPI
-from resources_servers.calendar.utils import grade_assistant_response
+from resources_servers.calendar.utils import grade_assistant_response, grade_assistant_response_intermediate
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -27,12 +28,16 @@ from nemo_gym.base_resources_server import (
 )
 
 
+LOG = logging.getLogger(__name__)
+
+
 class CalendarRunRequest(BaseRunRequest):
     exp_cal_state: dict[str, Any]
 
 
 class CalendarVerifyRequest(CalendarRunRequest, BaseVerifyRequest):
-    pass
+    turn_index: Optional[int] = None
+    total_turns: Optional[int] = None
 
 
 class CalendarResourcesServerConfig(BaseResourcesServerConfig):
@@ -69,8 +74,25 @@ class CalendarResourcesServer(SimpleResourcesServer):
             return BaseVerifyResponse(**body.model_dump(), reward=0)
 
         exp_cal_state = body.exp_cal_state
+        is_final_turn = body.turn_index is None or (
+            body.total_turns is not None and body.turn_index == body.total_turns - 1
+        )
+
         try:
-            reward, reason = grade_assistant_response(assistant_response, exp_cal_state)
+            if is_final_turn:
+                # Final turn: full constraint verification
+                reward, reason = grade_assistant_response(assistant_response, exp_cal_state)
+            else:
+                # Intermediate turn: structural validity only (no specific constraint check)
+                # because constraints may not have been requested yet at this turn.
+                reward, reason = grade_assistant_response_intermediate(assistant_response, exp_cal_state)
+                LOG.info(
+                    "Per-turn verify (turn %d/%d): reward=%s reason=%s",
+                    body.turn_index,
+                    body.total_turns,
+                    reward,
+                    reason,
+                )
         except Exception:
             reward = 0
 

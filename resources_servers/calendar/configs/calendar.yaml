@@ -9,6 +9,9 @@ calendar_simple_agent:
     simple_agent:
       entrypoint: app.py
       max_steps: 6
+      multi_turn: true
+      per_turn_verify: true
+      return_transitions: true
       resources_server:
         type: resources_servers
         name: calendar

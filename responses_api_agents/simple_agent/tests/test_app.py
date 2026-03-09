@@ -15,6 +15,7 @@
 import json
 from unittest.mock import AsyncMock, MagicMock, call
 
+import pytest
 from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
@@ -334,3 +335,408 @@ class TestApp:
             "safety_identifier": None,
         }
         assert expected_responses_dict == actual_responses_dict
+
+
+class TestSplitConversationTurns:
+    def test_basic_multi_turn(self):
+        input_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Add event A"},
+            {"role": "assistant", "content": "Done. Calendar: [A]"},
+            {"role": "user", "content": "Add event B"},
+            {"role": "assistant", "content": "Done. Calendar: [A, B]"},
+            {"role": "user", "content": "Move event A"},
+        ]
+        system_msgs, user_msgs = SimpleAgent._split_conversation_turns(input_messages)
+        assert len(system_msgs) == 1
+        assert system_msgs[0]["role"] == "system"
+        assert len(user_msgs) == 3
+        assert user_msgs[0]["content"] == "Add event A"
+        assert user_msgs[1]["content"] == "Add event B"
+        assert user_msgs[2]["content"] == "Move event A"
+
+    def test_single_turn(self):
+        input_messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        system_msgs, user_msgs = SimpleAgent._split_conversation_turns(input_messages)
+        assert len(system_msgs) == 1
+        assert len(user_msgs) == 1
+
+    def test_no_system_message(self):
+        input_messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "Bye"},
+        ]
+        system_msgs, user_msgs = SimpleAgent._split_conversation_turns(input_messages)
+        assert len(system_msgs) == 0
+        assert len(user_msgs) == 2
+
+    def test_multiple_system_messages(self):
+        input_messages = [
+            {"role": "system", "content": "System 1"},
+            {"role": "developer", "content": "Developer msg"},
+            {"role": "user", "content": "Hello"},
+        ]
+        system_msgs, user_msgs = SimpleAgent._split_conversation_turns(input_messages)
+        assert len(system_msgs) == 2
+        assert len(user_msgs) == 1
+
+
+class TestMultiTurnConfig:
+    def test_config_defaults(self):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            resources_server=ResourcesServerRef(type="resources_servers", name=""),
+            model_server=ModelServerRef(type="responses_api_models", name=""),
+        )
+        assert config.multi_turn is False
+        assert config.return_transitions is False
+
+    def test_config_multi_turn_enabled(self):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            multi_turn=True,
+            return_transitions=True,
+            resources_server=ResourcesServerRef(type="resources_servers", name=""),
+            model_server=ModelServerRef(type="responses_api_models", name=""),
+        )
+        assert config.multi_turn is True
+        assert config.return_transitions is True
+
+
+class TestMultiTurnRun:
+    @pytest.fixture
+    def mock_model_response(self):
+        return {
+            "id": "resp_test",
+            "created_at": 1000.0,
+            "model": "test_model",
+            "object": "response",
+            "output": [
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": "Model response", "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+
+    @pytest.fixture
+    def mock_verify_response(self):
+        return {
+            "reward": 1.0,
+            "responses_create_params": {"input": []},
+            "response": {
+                "id": "resp_test",
+                "created_at": 1000.0,
+                "model": "test_model",
+                "object": "response",
+                "output": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+        }
+
+    @pytest.fixture
+    def mock_seed_response(self):
+        return {}
+
+    async def test_multi_turn_run_splits_turns(self, mock_model_response, mock_verify_response, mock_seed_response):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="test_agent",
+            multi_turn=True,
+            return_transitions=True,
+            resources_server=ResourcesServerRef(type="resources_servers", name="test_resources"),
+            model_server=ModelServerRef(type="responses_api_models", name="test_model"),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+        seed_mock = AsyncMock()
+        seed_mock.read.return_value = json.dumps(mock_seed_response)
+        seed_mock.cookies = MagicMock()
+        seed_mock.cookies.items.return_value = []
+
+        model_mock = AsyncMock()
+        model_mock.read.return_value = json.dumps(mock_model_response)
+        model_mock.cookies = MagicMock()
+        model_mock.cookies.items.return_value = []
+
+        verify_mock = AsyncMock()
+        verify_mock.read.return_value = json.dumps(mock_verify_response)
+        verify_mock.cookies = MagicMock()
+        verify_mock.cookies.items.return_value = []
+
+        server.server_client.post = AsyncMock(side_effect=[seed_mock, model_mock, model_mock, verify_mock])
+
+        mock_request = MagicMock()
+        mock_request.cookies = {}
+
+        from responses_api_agents.simple_agent.app import SimpleAgentRunRequest
+
+        body = SimpleAgentRunRequest(
+            responses_create_params={
+                "input": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Add event A"},
+                    {"role": "assistant", "content": "Done."},
+                    {"role": "user", "content": "Add event B"},
+                ]
+            }
+        )
+
+        result = await server.run(mock_request, body)
+        assert result.reward == 1.0
+        assert result.all_turns is not None
+        assert len(result.all_turns) == 2
+        assert result.total_turns == 2
+        assert result.all_turns[0]["turn_index"] == 0
+        assert result.all_turns[1]["turn_index"] == 1
+
+    async def test_single_turn_run_returns_transitions(self, mock_model_response, mock_verify_response):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="test_agent",
+            multi_turn=False,
+            return_transitions=True,
+            resources_server=ResourcesServerRef(type="resources_servers", name="test_resources"),
+            model_server=ModelServerRef(type="responses_api_models", name="test_model"),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+        seed_mock = AsyncMock()
+        seed_mock.read.return_value = json.dumps({})
+        seed_mock.cookies = MagicMock()
+        seed_mock.cookies.items.return_value = []
+
+        model_mock = AsyncMock()
+        model_mock.read.return_value = json.dumps(mock_model_response)
+        model_mock.cookies = MagicMock()
+        model_mock.cookies.items.return_value = []
+
+        verify_mock = AsyncMock()
+        verify_mock.read.return_value = json.dumps(mock_verify_response)
+        verify_mock.cookies = MagicMock()
+        verify_mock.cookies.items.return_value = []
+
+        server.server_client.post = AsyncMock(side_effect=[seed_mock, model_mock, verify_mock])
+
+        mock_request = MagicMock()
+        mock_request.cookies = {}
+
+        from responses_api_agents.simple_agent.app import SimpleAgentRunRequest
+
+        body = SimpleAgentRunRequest(
+            responses_create_params={
+                "input": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Hello"},
+                ]
+            }
+        )
+
+        result = await server.run(mock_request, body)
+        assert result.reward == 1.0
+        assert result.all_turns is not None
+        assert len(result.all_turns) == 1
+        assert result.total_turns == 1
+
+    async def test_single_turn_no_transitions_when_disabled(self, mock_model_response, mock_verify_response):
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="test_agent",
+            multi_turn=False,
+            return_transitions=False,
+            resources_server=ResourcesServerRef(type="resources_servers", name="test_resources"),
+            model_server=ModelServerRef(type="responses_api_models", name="test_model"),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+        seed_mock = AsyncMock()
+        seed_mock.read.return_value = json.dumps({})
+        seed_mock.cookies = MagicMock()
+        seed_mock.cookies.items.return_value = []
+
+        model_mock = AsyncMock()
+        model_mock.read.return_value = json.dumps(mock_model_response)
+        model_mock.cookies = MagicMock()
+        model_mock.cookies.items.return_value = []
+
+        verify_mock = AsyncMock()
+        verify_mock.read.return_value = json.dumps(mock_verify_response)
+        verify_mock.cookies = MagicMock()
+        verify_mock.cookies.items.return_value = []
+
+        server.server_client.post = AsyncMock(side_effect=[seed_mock, model_mock, verify_mock])
+
+        mock_request = MagicMock()
+        mock_request.cookies = {}
+
+        from responses_api_agents.simple_agent.app import SimpleAgentRunRequest
+
+        body = SimpleAgentRunRequest(
+            responses_create_params={
+                "input": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Hello"},
+                ]
+            }
+        )
+
+        result = await server.run(mock_request, body)
+        assert result.reward == 1.0
+        assert result.all_turns is None
+
+    async def test_multi_turn_per_turn_verify(self, mock_model_response, mock_seed_response):
+        """Test that per_turn_verify calls /verify after each turn and records per-turn rewards."""
+        per_turn_verify_response_turn0 = {
+            "reward": 0.5,
+            "responses_create_params": {"input": []},
+            "response": {
+                "id": "resp_test",
+                "created_at": 1000.0,
+                "model": "test_model",
+                "object": "response",
+                "output": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+        }
+        per_turn_verify_response_turn1 = {
+            "reward": 1.0,
+            "responses_create_params": {"input": []},
+            "response": {
+                "id": "resp_test",
+                "created_at": 1000.0,
+                "model": "test_model",
+                "object": "response",
+                "output": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+        }
+        final_verify_response = {
+            "reward": 1.0,
+            "responses_create_params": {"input": []},
+            "response": {
+                "id": "resp_test",
+                "created_at": 1000.0,
+                "model": "test_model",
+                "object": "response",
+                "output": [],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            },
+        }
+
+        config = SimpleAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="test_agent",
+            multi_turn=True,
+            per_turn_verify=True,
+            return_transitions=True,
+            resources_server=ResourcesServerRef(type="resources_servers", name="test_resources"),
+            model_server=ModelServerRef(type="responses_api_models", name="test_model"),
+        )
+        server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+        seed_mock = AsyncMock()
+        seed_mock.read.return_value = json.dumps(mock_seed_response)
+        seed_mock.cookies = MagicMock()
+        seed_mock.cookies.items.return_value = []
+
+        model_mock = AsyncMock()
+        model_mock.read.return_value = json.dumps(mock_model_response)
+        model_mock.cookies = MagicMock()
+        model_mock.cookies.items.return_value = []
+
+        verify_turn0_mock = AsyncMock()
+        verify_turn0_mock.read.return_value = json.dumps(per_turn_verify_response_turn0)
+        verify_turn0_mock.cookies = MagicMock()
+        verify_turn0_mock.cookies.items.return_value = []
+
+        verify_turn1_mock = AsyncMock()
+        verify_turn1_mock.read.return_value = json.dumps(per_turn_verify_response_turn1)
+        verify_turn1_mock.cookies = MagicMock()
+        verify_turn1_mock.cookies.items.return_value = []
+
+        final_verify_mock = AsyncMock()
+        final_verify_mock.read.return_value = json.dumps(final_verify_response)
+        final_verify_mock.cookies = MagicMock()
+        final_verify_mock.cookies.items.return_value = []
+
+        # Call order: seed, model(turn0), verify(turn0), model(turn1), verify(turn1), final_verify
+        server.server_client.post = AsyncMock(
+            side_effect=[
+                seed_mock,
+                model_mock,
+                verify_turn0_mock,
+                model_mock,
+                verify_turn1_mock,
+                final_verify_mock,
+            ]
+        )
+
+        mock_request = MagicMock()
+        mock_request.cookies = {}
+
+        from responses_api_agents.simple_agent.app import SimpleAgentRunRequest
+
+        body = SimpleAgentRunRequest(
+            responses_create_params={
+                "input": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "Add event A"},
+                    {"role": "assistant", "content": "Done."},
+                    {"role": "user", "content": "Add event B"},
+                ]
+            }
+        )
+
+        result = await server.run(mock_request, body)
+
+        # Final reward from the last /verify
+        assert result.reward == 1.0
+        assert result.all_turns is not None
+        assert len(result.all_turns) == 2
+        assert result.total_turns == 2
+
+        # Per-turn rewards
+        assert result.all_turns[0]["reward"] == 0.5
+        assert result.all_turns[0]["verify_response"]["reward"] == 0.5
+        assert result.all_turns[1]["reward"] == 1.0
+        assert result.all_turns[1]["verify_response"]["reward"] == 1.0
+
+        # Verify that /verify was called with turn_index and total_turns
+        verify_calls = [c for c in server.server_client.post.call_args_list if c.kwargs.get("url_path") == "/verify"]
+        assert len(verify_calls) == 3  # 2 per-turn + 1 final
+        assert verify_calls[0].kwargs["json"]["turn_index"] == 0
+        assert verify_calls[0].kwargs["json"]["total_turns"] == 2
+        assert verify_calls[1].kwargs["json"]["turn_index"] == 1
+        assert verify_calls[1].kwargs["json"]["total_turns"] == 2

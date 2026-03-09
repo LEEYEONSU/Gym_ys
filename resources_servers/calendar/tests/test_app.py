@@ -30,7 +30,7 @@ class TestApp:
         config = CalendarResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name="")
         return CalendarResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
-    def _create_real_request(self, response_content, exp_cal_state, request_id=1):
+    def _create_real_request(self, response_content, exp_cal_state, request_id=1, turn_index=None, total_turns=None):
         """Helper to create real request with NeMoGymResponse."""
         # Create real NeMoGymResponse object
         response = NeMoGymResponse(
@@ -64,6 +64,8 @@ class TestApp:
             exp_cal_state=exp_cal_state,
             responses_create_params={"input": []},
             response=response,
+            turn_index=turn_index,
+            total_turns=total_turns,
         )
 
     def _run_verify_test(self, real_request, expected_reward):
@@ -493,3 +495,154 @@ class TestApp:
         )
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
+
+
+class TestPerTurnVerify:
+    """Tests for per-turn verification in multi-turn mode."""
+
+    def _create_server(self):
+        config = CalendarResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name="")
+        return CalendarResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+    def _create_request(self, response_content, exp_cal_state, turn_index=None, total_turns=None):
+        response = NeMoGymResponse(
+            id="resp_test",
+            created_at=0.0,
+            model="dummy",
+            object="response",
+            output=[
+                {
+                    "id": "msg_test",
+                    "content": [{"annotations": [], "text": response_content, "type": "output_text"}],
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                }
+            ],
+            parallel_tool_calls=True,
+            tool_choice="auto",
+            tools=[],
+        )
+        return CalendarVerifyRequest(
+            id=1,
+            exp_cal_state=exp_cal_state,
+            responses_create_params={"input": []},
+            response=response,
+            turn_index=turn_index,
+            total_turns=total_turns,
+        )
+
+    def test_intermediate_turn_valid_structure(self):
+        """Intermediate turn with valid calendar structure should get reward 1."""
+        exp_cal_state = {
+            "0": {
+                "event_id": 0,
+                "duration": 60,
+                "constraint": "between 10am and 11:45am",
+                "min_time": "10:00",
+                "max_time": "16:00",
+            },
+            "1": {
+                "event_id": 1,
+                "duration": 60,
+                "constraint": "before 1:45pm",
+                "min_time": "10:00",
+                "max_time": "16:00",
+            },
+        }
+        # Turn 0: only event 0 exists, no constraint check needed
+        response_content = '[{"event_id": 0, "event_name": "Meeting", "start_time": "10:00", "duration": 60}]'
+        request = self._create_request(response_content, exp_cal_state, turn_index=0, total_turns=5)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 1
+
+    def test_intermediate_turn_conflict_fails(self):
+        """Intermediate turn with conflicting events should get reward 0."""
+        exp_cal_state = {
+            "0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+            "1": {"event_id": 1, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+        }
+        response_content = (
+            '[{"event_id": 0, "start_time": "10:00", "duration": 60}, '
+            '{"event_id": 1, "start_time": "10:30", "duration": 60}]'
+        )
+        request = self._create_request(response_content, exp_cal_state, turn_index=1, total_turns=5)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 0
+
+    def test_intermediate_turn_wrong_duration_fails(self):
+        """Intermediate turn with wrong duration should get reward 0."""
+        exp_cal_state = {
+            "0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+        }
+        response_content = '[{"event_id": 0, "start_time": "10:00", "duration": 90}]'
+        request = self._create_request(response_content, exp_cal_state, turn_index=0, total_turns=3)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 0
+
+    def test_intermediate_turn_out_of_bounds_fails(self):
+        """Intermediate turn with event out of time bounds should get reward 0."""
+        exp_cal_state = {
+            "0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+        }
+        response_content = '[{"event_id": 0, "start_time": "09:00", "duration": 60}]'
+        request = self._create_request(response_content, exp_cal_state, turn_index=0, total_turns=3)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 0
+
+    def test_intermediate_turn_text_only_response(self):
+        """Intermediate turn with text-only response (no JSON) should pass."""
+        exp_cal_state = {
+            "0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+        }
+        response_content = "Sure, I can help with that! Let me add it to your calendar."
+        request = self._create_request(response_content, exp_cal_state, turn_index=0, total_turns=5)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 1
+
+    def test_final_turn_uses_full_verification(self):
+        """Last turn should use full constraint verification."""
+        exp_cal_state = {
+            "0": {
+                "event_id": 0,
+                "duration": 60,
+                "constraint": "between 2pm and 4pm",
+                "min_time": "10:00",
+                "max_time": "16:00",
+            },
+        }
+        # Event at 10am violates "between 2pm and 4pm" constraint
+        response_content = '[{"event_id": 0, "start_time": "10:00", "duration": 60}]'
+
+        # As final turn (turn_index == total_turns - 1): should fail
+        request_final = self._create_request(response_content, exp_cal_state, turn_index=4, total_turns=5)
+        server = self._create_server()
+        result_final = asyncio.run(server.verify(request_final))
+        assert result_final.reward == 0
+
+        # As intermediate turn: should pass (structural check only)
+        request_intermediate = self._create_request(response_content, exp_cal_state, turn_index=1, total_turns=5)
+        result_intermediate = asyncio.run(server.verify(request_intermediate))
+        assert result_intermediate.reward == 1
+
+    def test_no_turn_index_uses_full_verification(self):
+        """Request without turn_index should use full verification (backwards compat)."""
+        exp_cal_state = {
+            "0": {
+                "event_id": 0,
+                "duration": 60,
+                "constraint": "between 2pm and 4pm",
+                "min_time": "10:00",
+                "max_time": "16:00",
+            },
+        }
+        response_content = '[{"event_id": 0, "start_time": "10:00", "duration": 60}]'
+        request = self._create_request(response_content, exp_cal_state)
+        server = self._create_server()
+        result = asyncio.run(server.verify(request))
+        assert result.reward == 0

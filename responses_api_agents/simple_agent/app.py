@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from typing import List
+import logging
+from typing import Any, Dict, List, Optional
 
 from fastapi import Request, Response
 from pydantic import ConfigDict, ValidationError
@@ -40,10 +41,16 @@ from nemo_gym.openai_utils import (
 from nemo_gym.server_utils import get_response_json, raise_for_status
 
 
+LOG = logging.getLogger(__name__)
+
+
 class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
     max_steps: int = None
+    multi_turn: bool = False
+    per_turn_verify: bool = False
+    return_transitions: bool = False
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -56,10 +63,39 @@ class SimpleAgentVerifyRequest(BaseVerifyRequest):
 
 class SimpleAgentVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+    all_turns: Optional[List[Dict[str, Any]]] = None
+    total_turns: int = 0
 
 
 class SimpleAgent(SimpleResponsesAPIAgent):
     config: SimpleAgentConfig
+
+    @staticmethod
+    def _split_conversation_turns(input_messages: list) -> tuple:
+        """Split multi-turn conversation input into system context and per-turn user messages.
+
+        For multi-turn conversations (e.g. calendar), the input contains interleaved
+        user and assistant messages: [system, user1, asst1, user2, asst2, ..., userN].
+        This method extracts the system/developer prefix and the list of user messages.
+        Ground-truth assistant messages are skipped so the model generates each turn on-policy.
+
+        Returns:
+            (system_messages, user_messages): Lists of message dicts.
+        """
+        system_messages = []
+        user_messages = []
+        found_first_user = False
+
+        for msg in input_messages:
+            role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+            if role in ("system", "developer") and not found_first_user:
+                system_messages.append(msg)
+            elif role == "user":
+                found_first_user = True
+                user_messages.append(msg)
+            # Skip assistant messages - model will generate these on-policy
+
+        return system_messages, user_messages
 
     async def responses(
         self,
@@ -165,18 +201,98 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         await raise_for_status(seed_session_response)
         cookies = seed_session_response.cookies
 
-        response = await self.server_client.post(
-            server_name=self.config.name,
-            url_path="/v1/responses",
-            json=body.responses_create_params,
-            cookies=cookies,
-        )
-        await raise_for_status(response)
-        cookies = response.cookies
+        all_turns: List[Dict[str, Any]] = []
+        final_response_json = None
 
-        verify_request = SimpleAgentVerifyRequest.model_validate(
-            body.model_dump() | {"response": await get_response_json(response)}
-        )
+        if self.config.multi_turn:
+            # Multi-turn conversation mode: split the conversation history into individual turns
+            # and generate each assistant response on-policy. This enables per-turn RL training
+            # for benchmarks like calendar where input has [system, user1, asst1, user2, ..., userN].
+            params_dict = body.responses_create_params.model_dump()
+            system_msgs, user_msgs = self._split_conversation_turns(params_dict.get("input", []))
+
+            if not user_msgs:
+                raise ValueError("No user messages found in multi-turn input")
+
+            accumulated = list(system_msgs)
+
+            for turn_idx, user_msg in enumerate(user_msgs):
+                current_input = accumulated + [user_msg]
+                current_params = {**params_dict, "input": current_input}
+
+                LOG.info("Multi-turn: generating turn %d/%d", turn_idx + 1, len(user_msgs))
+
+                resp = await self.server_client.post(
+                    server_name=self.config.name,
+                    url_path="/v1/responses",
+                    json=current_params,
+                    cookies=cookies,
+                )
+                await raise_for_status(resp)
+                cookies = resp.cookies
+                response_json = await get_response_json(resp)
+
+                turn_record: Dict[str, Any] = {
+                    "turn_index": turn_idx,
+                    "input": current_input,
+                    "response": response_json,
+                }
+
+                # Per-turn verification: call /verify after each turn to get intermediate rewards.
+                # The resources server receives turn_index and total_turns so it can decide
+                # how to score intermediate states (e.g. partial calendar correctness).
+                if self.config.per_turn_verify:
+                    per_turn_verify_data = body.model_dump()
+                    per_turn_verify_data["response"] = response_json
+                    per_turn_verify_data["turn_index"] = turn_idx
+                    per_turn_verify_data["total_turns"] = len(user_msgs)
+
+                    per_turn_verify_resp = await self.server_client.post(
+                        server_name=self.config.resources_server.name,
+                        url_path="/verify",
+                        json=per_turn_verify_data,
+                        cookies=cookies,
+                    )
+                    await raise_for_status(per_turn_verify_resp)
+                    cookies = per_turn_verify_resp.cookies
+                    per_turn_verify_json = await get_response_json(per_turn_verify_resp)
+
+                    turn_record["reward"] = per_turn_verify_json.get("reward", 0.0)
+                    turn_record["verify_response"] = per_turn_verify_json
+
+                    LOG.info(
+                        "Multi-turn: turn %d/%d reward=%.2f",
+                        turn_idx + 1,
+                        len(user_msgs),
+                        turn_record["reward"],
+                    )
+
+                all_turns.append(turn_record)
+
+                # Use model's own output as context for next turn (on-policy generation)
+                accumulated = current_input + response_json.get("output", [])
+                final_response_json = response_json
+        else:
+            # Single-turn mode (original behavior): pass full input to /v1/responses
+            # which handles the tool-calling loop internally via responses().
+            resp = await self.server_client.post(
+                server_name=self.config.name,
+                url_path="/v1/responses",
+                json=body.responses_create_params,
+                cookies=cookies,
+            )
+            await raise_for_status(resp)
+            cookies = resp.cookies
+            final_response_json = await get_response_json(resp)
+
+            all_turns.append(
+                {
+                    "turn_index": 0,
+                    "response": final_response_json,
+                }
+            )
+
+        verify_request = SimpleAgentVerifyRequest.model_validate(body.model_dump() | {"response": final_response_json})
 
         verify_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
@@ -185,7 +301,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             cookies=cookies,
         )
         await raise_for_status(verify_response)
-        return SimpleAgentVerifyResponse.model_validate(await get_response_json(verify_response))
+        result = SimpleAgentVerifyResponse.model_validate(await get_response_json(verify_response))
+
+        if self.config.return_transitions:
+            result.all_turns = all_turns
+            result.total_turns = len(all_turns)
+
+        return result
 
 
 if __name__ == "__main__":

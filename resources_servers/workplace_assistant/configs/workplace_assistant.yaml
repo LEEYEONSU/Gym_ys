@@ -11,6 +11,7 @@ workplace_assistant_simple_agent:
     simple_agent:
       entrypoint: app.py
       max_steps: 6
+      return_transitions: true
       resources_server:
         type: resources_servers
         name: workplace_assistant
