@@ -49,6 +49,7 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     max_steps: int = None
     multi_turn: bool = False
+    per_turn_verify: bool = False
     return_transitions: bool = False
 
 
@@ -231,13 +232,42 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 cookies = resp.cookies
                 response_json = await get_response_json(resp)
 
-                all_turns.append(
-                    {
-                        "turn_index": turn_idx,
-                        "input": current_input,
-                        "response": response_json,
-                    }
-                )
+                turn_record: Dict[str, Any] = {
+                    "turn_index": turn_idx,
+                    "input": current_input,
+                    "response": response_json,
+                }
+
+                # Per-turn verification: call /verify after each turn to get intermediate rewards.
+                # The resources server receives turn_index and total_turns so it can decide
+                # how to score intermediate states (e.g. partial calendar correctness).
+                if self.config.per_turn_verify:
+                    per_turn_verify_data = body.model_dump()
+                    per_turn_verify_data["response"] = response_json
+                    per_turn_verify_data["turn_index"] = turn_idx
+                    per_turn_verify_data["total_turns"] = len(user_msgs)
+
+                    per_turn_verify_resp = await self.server_client.post(
+                        server_name=self.config.resources_server.name,
+                        url_path="/verify",
+                        json=per_turn_verify_data,
+                        cookies=cookies,
+                    )
+                    await raise_for_status(per_turn_verify_resp)
+                    cookies = per_turn_verify_resp.cookies
+                    per_turn_verify_json = await get_response_json(per_turn_verify_resp)
+
+                    turn_record["reward"] = per_turn_verify_json.get("reward", 0.0)
+                    turn_record["verify_response"] = per_turn_verify_json
+
+                    LOG.info(
+                        "Multi-turn: turn %d/%d reward=%.2f",
+                        turn_idx + 1,
+                        len(user_msgs),
+                        turn_record["reward"],
+                    )
+
+                all_turns.append(turn_record)
 
                 # Use model's own output as context for next turn (on-policy generation)
                 accumulated = current_input + response_json.get("output", [])
