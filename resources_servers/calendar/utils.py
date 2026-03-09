@@ -152,6 +152,54 @@ def is_constraint_satisfied(event, exp_event):
     return True
 
 
+def grade_assistant_response_intermediate(assistant_response, exp_cal_state):
+    """Grade an intermediate turn: structural validity only (no specific constraint check).
+
+    Checks that the calendar is:
+    - Valid JSON list
+    - No overlapping events
+    - Correct durations for known events
+    - All events within min_time/max_time bounds
+
+    Does NOT check specific constraints (before/after/between/at) since those
+    may not have been requested yet at this turn in the conversation.
+    """
+    if "<think>" in assistant_response:
+        return 0, "think_found"
+
+    cal_state = extract_json_list(assistant_response)
+    if cal_state is None:
+        # Early turns may have no events yet or just a text response
+        return 1, "pass_no_json"
+
+    if len(cal_state) == 0:
+        return 1, "pass_empty"
+
+    # Check no time conflicts
+    for event in cal_state:
+        if is_event_conflicting(cal_state, event, exclude_event=event):
+            return 0, "conflicting_events"
+
+    # Check durations and time bounds for events that exist in exp_cal_state
+    for event in cal_state:
+        eid = str(event.get("event_id"))
+        if eid in exp_cal_state:
+            exp_event = exp_cal_state[eid]
+            if event.get("duration") != exp_event["duration"]:
+                return 0, "wrong_duration"
+            try:
+                start = time_to_minutes(event["start_time"])
+                end = start + event["duration"]
+                min_t = time_to_minutes(exp_event["min_time"])
+                max_t = time_to_minutes(exp_event["max_time"])
+                if start < min_t or end > max_t:
+                    return 0, "out_of_bounds"
+            except (ValueError, KeyError):
+                return 0, "error_in_grading"
+
+    return 1, "pass"
+
+
 def grade_assistant_response(assistant_response, exp_cal_state, allow_no_json_list=False):
     # invalid response
     if "<think>" in assistant_response:
